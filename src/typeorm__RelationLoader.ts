@@ -1,0 +1,312 @@
+import type { DataSource } from "../data-source/DataSource"
+import type { ObjectLiteral } from "../common/ObjectLiteral"
+import type { QueryRunner } from "../query-runner/QueryRunner"
+import type { RelationMetadata } from "../metadata/RelationMetadata"
+import { DriverUtils } from "../driver/DriverUtils"
+import { FindOptionsUtils } from "../find-options/FindOptionsUtils"
+import type { SelectQueryBuilder } from "./SelectQueryBuilder"
+
+/**
+ * Loads relation data for entities and provides lazy-load wrappers
+ * via getters/setters.
+ */
+export class RelationLoader {
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
+
+    constructor(private dataSource: DataSource) {}
+
+    // -------------------------------------------------------------------------
+    // Public Methods
+    // -------------------------------------------------------------------------
+
+    /**
+     * Loads relation data for the given entity and its relation.
+     *
+     * @param relation
+     * @param entityOrEntities
+     * @param queryRunner
+     * @param queryBuilder
+     * @param loadEagerRelations
+     */
+    load(
+        relation: RelationMetadata,
+        entityOrEntities: ObjectLiteral | ObjectLiteral[],
+        queryRunner?: QueryRunner,
+        queryBuilder?: SelectQueryBuilder<any>,
+        loadEagerRelations?: boolean,
+    ): Promise<any[]> {
+        // todo: check all places where it uses non array
+        if (queryRunner?.isReleased) queryRunner = undefined // get new one if already closed
+        if (relation.isManyToOne || relation.isOneToOneOwner) {
+            return this.loadManyToOneOrOneToOneOwner(
+                relation,
+                entityOrEntities,
+                queryRunner,
+                queryBuilder,
+                loadEagerRelations,
+            )
+        } else if (relation.isOneToMany || relation.isOneToOneNotOwner) {
+            return this.loadOneToManyOrOneToOneNotOwner(
+                relation,
+                entityOrEntities,
+                queryRunner,
+                queryBuilder,
+                loadEagerRelations,
+            )
+        } else if (relation.isManyToManyOwner) {
+            return this.loadManyToManyOwner(
+                relation,
+                entityOrEntities,
+                queryRunner,
+                queryBuilder,
+                loadEagerRelations,
+            )
+        } else {
+            // many-to-many non owner
+            return this.loadManyToManyNotOwner(
+                relation,
+                entityOrEntities,
+                queryRunner,
+                queryBuilder,
+                loadEagerRelations,
+            )
+        }
+    }
+
+    /**
+     * Loads data for many-to-one and one-to-one owner relations.
+     *
+     * (ow) post.category<=>category.post
+     * loaded: category from post
+     *
+     * @example
+     * SELECT category.id AS category_id, category.name AS category_name FROM category category
+     *     INNER JOIN post Post ON Post.category=category.id WHERE Post.id=1
+     *
+     * @param relation
+     * @param entityOrEntities
+     * @param queryRunner
+     * @param queryBuilder
+     * @param loadEagerRelations
+     */
+    loadManyToOneOrOneToOneOwner(
+        relation: RelationMetadata,
+        entityOrEntities: ObjectLiteral | ObjectLiteral[],
+        queryRunner?: QueryRunner,
+        queryBuilder?: SelectQueryBuilder<any>,
+        loadEagerRelations?: boolean,
+    ): Promise<any> {
+        const entities = Array.isArray(entityOrEntities)
+            ? entityOrEntities
+            : [entityOrEntities]
+
+        const qb =
+            queryBuilder ??
+            this.dataSource
+                .createQueryBuilder(queryRunner)
+                .select(relation.propertyName)
+                .from(relation.type, relation.propertyName)
+
+        const mainAlias = qb.expressionMap.mainAlias!.name
+
+        // For self-referencing relations the entity name already exists
+        // as an alias, so we need to generate a unique join alias name.
+        const baseName = relation.entityMetadata.name
+        let joinAliasName = DriverUtils.buildAlias(
+            this.dataSource.driver,
+            { shorten: true },
+            baseName,
+        )
+        let suffix = 1
+        while (
+            qb.expressionMap.aliases.some(({ name }) => name === joinAliasName)
+        ) {
+            joinAliasName = DriverUtils.buildAlias(
+                this.dataSource.driver,
+                { shorten: true },
+                baseName,
+                String(suffix++),
+            )
+        }
+
+        const columns = relation.entityMetadata.primaryColumns
+        const joinColumns = relation.isOwning
+            ? relation.joinColumns
+            : relation.inverseRelation!.joinColumns
+        const conditions = joinColumns
+            .map((joinColumn) => {
+                return `${joinAliasName}.${
+                    joinColumn.propertyName
+                } = ${mainAlias}.${joinColumn.referencedColumn!.propertyName}`
+            })
+            .join(" AND ")
+
+        qb.innerJoin(
+            relation.entityMetadata.target as Function,
+            joinAliasName,
+            conditions,
+        )
+
+        if (columns.length === 1) {
+            qb.where(
+                `${joinAliasName}.${columns[0].propertyPath} IN (:...${
+                    joinAliasName + "_" + columns[0].propertyName
+                })`,
+            )
+            qb.setParameter(
+                joinAliasName + "_" + columns[0].propertyName,
+                entities.map((entity) =>
+                    columns[0].getEntityValue(entity, true),
+                ),
+            )
+        } else {
+            const condition = entities
+                .map((entity, entityIndex) => {
+                    return columns
+                        .map((column, columnIndex) => {
+                            const paramName =
+                                joinAliasName +
+                                "_entity_" +
+                                entityIndex +
+                                "_" +
+                                columnIndex
+                            qb.setParameter(
+                                paramName,
+                                column.getEntityValue(entity, true),
+                            )
+                            return (
+                                joinAliasName +
+                                "." +
+                                column.propertyPath +
+                                " = :" +
+                                paramName
+                            )
+                        })
+                        .join(" AND ")
+                })
+                .map((condition) => "(" + condition + ")")
+                .join(" OR ")
+            qb.where(condition)
+        }
+
+        this.applyEagerRelations(qb, loadEagerRelations)
+
+        return qb.getMany()
+    }
+
+    /**
+     * Loads data for one-to-many and one-to-one not owner relations.
+     *
+     * SELECT post
+     * FROM post post
+     * WHERE post.[joinColumn.name] = entity[joinColumn.referencedColumn]
+     *
+     * @param relation
+     * @param entityOrEntities
+     * @param queryRunner
+     * @param queryBuilder
+     * @param loadEagerRelations
+     */
+    loadOneToManyOrOneToOneNotOwner(
+        relation: RelationMetadata,
+        entityOrEntities: ObjectLiteral | ObjectLiteral[],
+        queryRunner?: QueryRunner,
+        queryBuilder?: SelectQueryBuilder<any>,
+        loadEagerRelations?: boolean,
+    ): Promise<any> {
+        const entities = Array.isArray(entityOrEntities)
+            ? entityOrEntities
+            : [entityOrEntities]
+        const columns = relation.inverseRelation!.joinColumns
+        const qb =
+            queryBuilder ??
+            this.dataSource
+                .createQueryBuilder(queryRunner)
+                .select(relation.propertyName)
+                .from(
+                    relation.inverseRelation!.entityMetadata.target,
+                    relation.propertyName,
+                )
+
+        const aliasName = qb.expressionMap.mainAlias!.name
+
+        if (columns.length === 1) {
+            qb.where(
+                `${aliasName}.${columns[0].propertyPath} IN (:...${
+                    aliasName + "_" + columns[0].propertyName
+                })`,
+            )
+            qb.setParameter(
+                aliasName + "_" + columns[0].propertyName,
+                entities.map((entity) =>
+                    columns[0].referencedColumn!.getEntityValue(entity, true),
+                ),
+            )
+        } else {
+            const condition = entities
+                .map((entity, entityIndex) => {
+                    return columns
+                        .map((column, columnIndex) => {
+                            const paramName =
+                                aliasName +
+                                "_entity_" +
+                                entityIndex +
+                                "_" +
+                                columnIndex
+                            qb.setParameter(
+                                paramName,
+                                column.referencedColumn!.getEntityValue(
+                                    entity,
+                                    true,
+                                ),
+                            )
+                            return (
+                                aliasName +
+                                "." +
+                                column.propertyPath +
+                                " = :" +
+                                paramName
+                            )
+                        })
+                        .join(" AND ")
+                })
+                .map((condition) => "(" + condition + ")")
+                .join(" OR ")
+            qb.where(condition)
+        }
+
+        this.applyEagerRelations(qb, loadEagerRelations)
+
+        return qb.getMany()
+    }
+
+    /**
+     * Applies eager relation loading to the given query builder based on the
+     * configured relation load strategy.
+     *
+     * @param qb
+     * @param loadEagerRelations
+     */
+    private applyEagerRelations(
+        qb: SelectQueryBuilder<any>,
+        loadEagerRelations?: boolean,
+    ): void {
+        if (loadEagerRelations === false) return
+
+        const mainAlias = qb.expressionMap.mainAlias
+        if (!mainAlias) return
+
+        if (qb.expressionMap.relationLoadStrategy === "query") {
+            qb.concatRelationMetadata(...mainAlias.metadata.eagerRelations)
+        } else {
+            FindOptionsUtils.joinEagerRelations(
+                qb,
+                qb.alias,
+                mainAlias.metadata,
+            )
+        }
+    }
+
+}
